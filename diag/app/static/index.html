@@ -46,6 +46,26 @@
   .err { color:#a40e26; font-size:13px; }
   .hidden { display:none; }
   code { background:var(--bg); padding:1px 5px; border-radius:4px; }
+  .release-banner { font-size:18px; font-weight:700; text-align:center; padding:12px;
+                    border-radius:8px; margin-bottom:10px; }
+  .r-released { background:#dafbe1; color:#116329; border:1px solid #4ac26b; }
+  .r-pending  { background:#fff8c5; color:#7d4e00; border:1px solid #d4a72c; }
+  .r-progress { background:#ddf4ff; color:#0a3069; border:1px solid #54aeff; }
+  .r-none     { background:#eaeef2; color:#57606a; border:1px solid #8c959f; }
+  .src-state { border:1px solid var(--border); border-radius:8px; padding:12px 14px;
+               margin-top:10px; }
+  .src-state h4 { margin:0 0 8px; font-size:14px; }
+  .src-state.fail { border-color:#ff8182; background:#fff5f5; }
+  .src-state.ok   { border-color:#4ac26b; background:#f6fff8; }
+  .src-state.wait { border-color:#d4a72c; background:#fffdf0; }
+  .kv { font-size:12px; line-height:1.8; }
+  .kv b { color:#24292f; }
+  .pill { display:inline-block; font-size:11px; padding:1px 8px; border-radius:10px;
+          font-weight:600; margin-left:6px; }
+  .p-ok { background:#dafbe1; color:#116329; }
+  .p-bad { background:#ffebe9; color:#a40e26; }
+  .p-wait { background:#fff8c5; color:#7d4e00; }
+  .p-gray { background:#eaeef2; color:#57606a; }
 </style>
 </head>
 <body>
@@ -84,6 +104,30 @@
     <p class="reason" id="reasonText"></p>
     <div id="sourceTables"></div>
     <p id="intersectionText" class="muted"></p>
+  </section>
+
+  <section>
+    <h2>四、维护发布核验</h2>
+    <p class="muted">为两台源各填写维护目标（目标钟差、目标回包延迟）与核验容差，
+      提交一次维护发布。系统会下发配置，并用真实 UDP 回包核验每台源的钟差
+      不确定区间是否<b>完整落入</b>各自目标值 ± 容差；两源都核实且配置未再变化
+      才显示“已发布”。提交即撤销旧发布结论。</p>
+    <div class="cards" id="releaseInputs"></div>
+    <div class="row">
+      <div>
+        <label for="relTimeout">单源探测超时（毫秒）</label>
+        <input id="relTimeout" type="number" value="2000" min="200" max="30000" step="100">
+      </div>
+      <div style="flex:0">
+        <button id="releaseBtn" onclick="submitRelease()">提交维护发布</button>
+      </div>
+      <div style="flex:0">
+        <button class="secondary" onclick="loadRelease()">刷新实况</button>
+      </div>
+    </div>
+    <div id="releaseStatus" style="margin-top:14px">
+      <div class="release-banner r-none">读取发布状态…</div>
+    </div>
   </section>
 </main>
 
@@ -130,7 +174,7 @@ async function loadSources() {
       box.appendChild(card);
     }
   } catch (e) {
-    box.innerHTML = `<p class="err">读取源配置失败：${e.message}</p>`;
+    box.innerHTML = `<p class="err">读取源配置失败：${esc(e.message)}</p>`;
   }
 }
 
@@ -147,7 +191,7 @@ async function applyConfig(id) {
 }
 
 function sourceTable(s) {
-  if (!s.ok) return `<p class="err">源 ${s.id}（${s.name}）：探测失败 — ${s.error}</p>`;
+  if (!s.ok) return `<p class="err">源 ${s.id}（${esc(s.name)}）：探测失败 — ${esc(s.error)}</p>`;
   const t = s.timestamps;
   return `<table><tr><th class="l">源 ${s.id}：${s.name}</th>
     <th>t1 发送</th><th>t2 源收</th><th>t3 源发</th><th>t4 本机收</th>
@@ -183,6 +227,179 @@ async function runDiagnose() {
 }
 
 loadSources();
+
+// ============================================================ 维护发布
+
+const RELEASE_CLASS = { released:'r-released', pending:'r-pending',
+                        in_progress:'r-progress', superseded:'r-pending',
+                        not_released:'r-none' };
+const SRC_STATUS = {
+  verified:      ['核验通过', 'p-ok'],
+  mismatch:      ['核验不符', 'p-bad'],
+  apply_failed:  ['下发失败', 'p-bad'],
+  probe_failed:  ['探测异常', 'p-bad'],
+  config_changed:['配置已变', 'p-bad'],
+  blocked:       ['未核验', 'p-wait'],
+  superseded:    ['结果作废', 'p-gray'],
+  pending:       ['待下发', 'p-gray'],
+  applying:      ['下发中', 'p-gray'],
+  probing:       ['探测中', 'p-gray'],
+};
+
+function esc(v) {
+  return String(v === null || v === undefined ? '' : v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function renderReleaseInputs(sources) {
+  const box = document.getElementById('releaseInputs');
+  if (box.dataset.ready === '1') return;  // 保留维护员已填写的内容
+  box.innerHTML = '';
+  for (const s of sources) {
+    // 默认以源端当前实况为起点，维护员再按本次维护目标修改
+    const off = (s.reachable && s.offset_ms !== null) ? s.offset_ms : 0;
+    const dly = (s.reachable && s.reply_delay_ms !== null) ? s.reply_delay_ms : 20;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = `
+      <h3>源 ${s.id}：${s.name}</h3>
+      <label>目标钟差 offset（毫秒，源钟 − 真实时间）</label>
+      <input id="rtOff${s.id}" type="number" step="any" value="${off}">
+      <label>目标回包延迟（毫秒）</label>
+      <input id="rtDly${s.id}" type="number" step="any" min="0" value="${dly}">
+      <label>核验容差 ±（毫秒）</label>
+      <input id="rtTol${s.id}" type="number" step="any" min="0.001" value="5">
+    `;
+    box.appendChild(card);
+  }
+  box.dataset.ready = '1';
+}
+
+function srcStateCard(s) {
+  const [text, cls] = SRC_STATUS[s.status] || [s.status || '未知', 'p-gray'];
+  const boxCls = s.verified ? 'ok' : (s.status === 'mismatch' || s.status === 'apply_failed'
+                    || s.status === 'probe_failed' || s.status === 'config_changed'
+                    ? 'fail' : 'wait');
+  const range = s.target_interval_ms;
+  const actual = s.actual_config;
+  const iv = s.interval_ms;
+  const tol = s.target_tolerance_ms;
+  return `<div class="src-state ${boxCls}">
+    <h4>源 ${s.id}：${esc(s.name)}<span class="pill ${cls}">${text}</span></h4>
+    <div class="kv">
+      <div><b>维护目标</b>：钟差 ${fmt(s.target_offset_ms)} ms，回包延迟
+        ${fmt(s.target_reply_delay_ms)} ms；核验容差 ±${fmt(tol)} ms，
+        要求实测区间完整落于 [${fmt(range[0])}, ${fmt(range[1])}] ms</div>
+      <div><b>源端实况</b>：${actual
+          ? `offset=${fmt(actual.offset_ms,1)} ms，delay=${fmt(actual.reply_delay_ms,1)} ms`
+          : '（未回读到配置）'}</div>
+      ${iv ? `<div><b>UDP 实测</b>：θ=${fmt(s.offset_ms)} ms，δ=${fmt(s.delay_ms)} ms，
+        区间 [${fmt(iv[0])}, ${fmt(iv[1])}] ms
+        ${s.within_tolerance ? '<span class="pill p-ok">完整落入容差</span>'
+                             : '<span class="pill p-bad">未落入容差</span>'}</div>`
+          : `<div><b>UDP 实测</b>：未取得有效回包</div>`}
+      ${s.timestamps ? `<div class="muted">t1 ${fmtTs(s.timestamps.t1)} ·
+        t2 ${fmtTs(s.timestamps.t2)} · t3 ${fmtTs(s.timestamps.t3)} ·
+        t4 ${fmtTs(s.timestamps.t4)}</div>` : ''}
+      ${s.error ? `<div class="err">${esc(s.error)}</div>` : ''}
+    </div>
+  </div>`;
+}
+
+function releaseLabel(status) {
+  return { released:'已发布', pending:'待处理（未发布）',
+           in_progress:'核验中…', superseded:'已被取代（未发布）' }[status]
+         || '未发布';
+}
+
+function renderRelease(st) {
+  const box = document.getElementById('releaseStatus');
+  const cls = RELEASE_CLASS[st.status] || 'r-none';
+  const label = releaseLabel(st.status);
+  const sources = (st.sources || []).map(srcStateCard).join('');
+  box.innerHTML = `
+    <div class="release-banner ${cls}">${label}</div>
+    <p class="reason">${esc(st.reason || '')}</p>
+    <p class="muted">状态版本 generation=${st.generation ?? '—'}
+      ${st.updated_at ? '· 更新于 ' + new Date(st.updated_at*1000).toLocaleString('zh-CN',{hour12:false}) : ''}
+      ${st.published ? '' : '· 未核实或已变更的配置不会显示为已发布'}</p>
+    ${sources}`;
+}
+
+async function loadRelease() {
+  try {
+    const st = await api('/api/release');
+    renderRelease(st);
+    if (st.sources && st.sources.length) {
+      // 回填上次提交的目标值，便于重试
+      for (const s of st.sources) {
+        const o = document.getElementById('rtOff'+s.id);
+        if (o) { o.value = s.target_offset_ms; }
+        const d = document.getElementById('rtDly'+s.id);
+        if (d) { d.value = s.target_reply_delay_ms; }
+        const t = document.getElementById('rtTol'+s.id);
+        if (t) { t.value = s.target_tolerance_ms; }
+      }
+    }
+  } catch (e) {
+    document.getElementById('releaseStatus').innerHTML =
+      `<div class="release-banner r-none">读取发布状态失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function submitRelease() {
+  const btn = document.getElementById('releaseBtn');
+  const box = document.getElementById('releaseStatus');
+  const sources = [1, 2].map(id => {
+    const off = document.getElementById('rtOff'+id);
+    const dly = document.getElementById('rtDly'+id);
+    const tol = document.getElementById('rtTol'+id);
+    if (!off || !dly || !tol) return null;
+    return {
+      id,
+      offset_ms: parseFloat(off.value),
+      reply_delay_ms: parseFloat(dly.value),
+      tolerance_ms: parseFloat(tol.value),
+    };
+  });
+  if (sources.some(s => !s || !Number.isFinite(s.offset_ms)
+                     || !Number.isFinite(s.reply_delay_ms)
+                     || !Number.isFinite(s.tolerance_ms) || s.tolerance_ms <= 0)) {
+    box.innerHTML = `<div class="release-banner r-pending">
+      请为两台源填写有效的目标钟差、目标回包延迟与正的核验容差</div>`;
+    return;
+  }
+  btn.disabled = true; btn.textContent = '下发并核验中…';
+  box.innerHTML = `<div class="release-banner r-progress">核验中…</div>
+    <p class="muted">正在下发两源配置并用真实 UDP 回包核验，请稍候。</p>`;
+  // 核验期间轮询实况（服务端状态机实时更新）
+  const timer = setInterval(() => loadRelease(), 500);
+  try {
+    const timeout_ms = parseInt(document.getElementById('relTimeout').value, 10) || 2000;
+    const attempt = await api('/api/release', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ sources, timeout_ms }),
+    });
+    clearInterval(timer);
+    renderRelease(attempt);
+    loadSources();
+  } catch (e) {
+    clearInterval(timer);
+    box.innerHTML = `<div class="release-banner r-pending">提交失败：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false; btn.textContent = '提交维护发布';
+  }
+}
+
+async function init() {
+  try {
+    const data = await api('/api/sources');
+    renderReleaseInputs(data.sources);
+  } catch (e) { /* loadSources 已负责提示 */ }
+  loadRelease();
+}
+init();
 </script>
 </body>
 </html>
